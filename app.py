@@ -42,6 +42,7 @@ PREFERRED_SHEETS = [
     "LT con lai",
 ]
 
+# Cột cần hiển thị trong bảng chi tiết.
 DISPLAY_COLUMNS = [
     "mst",
     "ten_kh",
@@ -51,6 +52,8 @@ DISPLAY_COLUMNS = [
     "ten_kcn",
 ]
 
+# Các cột sản lượng dịch vụ dùng để xác định khách hàng đang dùng từng loại dịch vụ.
+# Bạn có thể bổ sung hoặc đổi tên hiển thị tại đây.
 SERVICE_COLUMNS = {
     "Internet / Net": "net_sl",
     "Internet khác": "int_sl",
@@ -114,20 +117,27 @@ def clean_dataframe(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
     """Làm sạch dữ liệu sau khi đọc từng sheet."""
     df = df.copy()
 
+    # Chuẩn hóa tên cột
     df.columns = [normalize_column_name(c) for c in df.columns]
+
+    # Loại bỏ các cột Unnamed nếu có
     df = df.loc[:, ~df.columns.str.contains("^Unnamed", case=False, na=False)]
 
+    # Chỉ xử lý sheet có cột tối thiểu
     required_cols = {"mst", "ten_kh", "tong_sl"}
     if not required_cols.issubset(set(df.columns)):
         return pd.DataFrame()
 
+    # Thêm cột KCN dựa trên tên sheet
     df["source_sheet"] = sheet_name
     df["ten_kcn"] = infer_kcn_name(sheet_name)
 
+    # Loại bỏ dòng tổng cộng hoặc dòng trống
     df["mst"] = df["mst"].astype(str).str.strip()
     df = df[~df["mst"].str.lower().isin(["nan", "none", "", "tổng cộng:", "tong cong:", "tổng cộng"])]
     df = df[~df["mst"].str.contains("tổng", case=False, na=False)]
 
+    # Chuẩn hóa số liệu
     numeric_cols = [c for c in df.columns if c.endswith("_sl") or c.endswith("_dthu")]
     numeric_cols += ["tong_sl", "tong_dthu", "dthu"]
     numeric_cols = list(dict.fromkeys([c for c in numeric_cols if c in df.columns]))
@@ -135,10 +145,12 @@ def clean_dataframe(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
+    # Chuẩn hóa text
     for col in ["ten_kh", "diachi_kh", "huyen", "phuong", "tinh"]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str).str.strip()
 
+    # Trạng thái sử dụng dịch vụ
     df["trang_thai"] = df["tong_sl"].apply(
         lambda x: "Đang dùng" if pd.notna(x) and float(x) > 0 else "Chưa dùng / Tiềm năng"
     )
@@ -159,6 +171,7 @@ def load_excel_data(file_source) -> pd.DataFrame:
         if should_ignore_sheet(sheet):
             continue
 
+        # Ưu tiên lấy các sheet KCN. DS TONG là bảng tổng, dễ gây trùng dữ liệu nếu gom chung.
         if sheet not in PREFERRED_SHEETS:
             continue
 
@@ -182,10 +195,85 @@ def load_excel_data(file_source) -> pd.DataFrame:
 
     df = pd.concat(frames, ignore_index=True)
 
+    # Xóa trùng theo mã số thuế + KCN nếu có dòng lặp.
     if "mst" in df.columns and "ten_kcn" in df.columns:
         df = df.drop_duplicates(subset=["mst", "ten_kcn"], keep="first")
 
     return df
+
+
+def initialize_session_data(base_df: pd.DataFrame, data_source_key: str) -> None:
+    """
+    Khởi tạo dữ liệu làm việc trong session_state.
+    Khi đổi file nguồn, app tự reset lại dữ liệu theo file mới.
+    """
+    if (
+        "customer_df" not in st.session_state
+        or st.session_state.get("data_source_key") != data_source_key
+    ):
+        st.session_state.customer_df = base_df.copy()
+        st.session_state.data_source_key = data_source_key
+        st.session_state.added_customers_count = 0
+
+
+def build_new_customer_row(
+    current_df: pd.DataFrame,
+    mst: str,
+    ten_kh: str,
+    ten_kcn: str,
+    selected_services: list[str],
+    estimated_revenue: float,
+) -> dict:
+    """
+    Tạo một dòng dữ liệu mới theo đúng cấu trúc cột hiện tại của DataFrame.
+    Các cột không nhập sẽ được điền giá trị mặc định để tránh lỗi concat.
+    """
+    numeric_cols = [
+        c
+        for c in current_df.columns
+        if c.endswith("_sl") or c.endswith("_dthu") or c in ["tong_sl", "tong_dthu", "dthu"]
+    ]
+
+    new_row = {}
+    for col in current_df.columns:
+        if col in numeric_cols:
+            new_row[col] = 0
+        else:
+            new_row[col] = ""
+
+    new_row["mst"] = mst.strip()
+    new_row["ten_kh"] = ten_kh.strip()
+    new_row["diachi_kh"] = ""
+    new_row["ten_kcn"] = ten_kcn
+    new_row["source_sheet"] = "Nhập liệu thủ công"
+
+    # Mỗi dịch vụ được chọn sẽ được tính là 1 sản lượng để dashboard nhận diện là đang dùng.
+    for service_name in selected_services:
+        service_sl_col = SERVICE_COLUMNS.get(service_name)
+        if service_sl_col and service_sl_col in current_df.columns:
+            new_row[service_sl_col] = 1
+
+    total_service_count = len(selected_services)
+    new_row["tong_sl"] = total_service_count
+    if "tong_dthu" in current_df.columns:
+        new_row["tong_dthu"] = float(estimated_revenue)
+    if "dthu" in current_df.columns:
+        new_row["dthu"] = float(estimated_revenue)
+
+    # Nếu có cột doanh thu theo dịch vụ, chia đều doanh thu ước tính cho các dịch vụ được chọn.
+    if selected_services and estimated_revenue > 0:
+        revenue_per_service = float(estimated_revenue) / len(selected_services)
+        for service_name in selected_services:
+            service_sl_col = SERVICE_COLUMNS.get(service_name)
+            if not service_sl_col:
+                continue
+            service_revenue_col = service_sl_col.replace("_sl", "_dthu")
+            if service_revenue_col in current_df.columns:
+                new_row[service_revenue_col] = revenue_per_service
+
+    new_row["trang_thai"] = "Đang dùng" if total_service_count > 0 else "Chưa dùng / Tiềm năng"
+
+    return new_row
 
 
 def get_service_usage(df: pd.DataFrame) -> pd.DataFrame:
@@ -247,8 +335,10 @@ with st.sidebar:
         "App đang tự lấy tên KCN từ tên sheet như KCN LT, KCN GD, KCN LA-BS, KCN AMATA LT."
     )
 
+# Ưu tiên file người dùng upload. Nếu không có, đọc file mặc định trong repo.
 if uploaded_file is not None:
     file_source = uploaded_file
+    data_source_key = f"uploaded::{uploaded_file.name}::{uploaded_file.size}"
 else:
     file_path = Path(DEFAULT_FILE)
     if not file_path.exists():
@@ -258,18 +348,98 @@ else:
         )
         st.stop()
     file_source = str(file_path)
+    data_source_key = f"default::{DEFAULT_FILE}"
 
-df = load_excel_data(file_source)
+# Đọc dữ liệu gốc và đưa vào session_state để có thể thêm dòng mới ngay trên web.
+base_df = load_excel_data(file_source)
 
-if df.empty:
+if base_df.empty:
     st.error(
         "Không đọc được dữ liệu chuẩn. Hãy kiểm tra file có các cột `mst`, `ten_kh`, `tong_sl` hay không."
     )
     st.stop()
 
+initialize_session_data(base_df, data_source_key)
+df = st.session_state.customer_df.copy()
+
+# Danh sách KCN/dịch vụ dùng chung cho form và bộ lọc.
+kcn_list = sorted(df["ten_kcn"].dropna().unique().tolist())
+service_options = [name for name, col in SERVICE_COLUMNS.items() if col in df.columns]
+
 
 # =========================
-# 5. Bộ lọc KCN
+# 5. Form thêm khách hàng
+# =========================
+with st.sidebar:
+    st.markdown("---")
+    st.header("➕ Thêm Khách Hàng")
+
+    with st.form("add_customer_form", clear_on_submit=True):
+        input_mst = st.text_input("Mã số thuế", placeholder="Ví dụ: 3600123456")
+        input_ten_kh = st.text_input("Tên doanh nghiệp", placeholder="Ví dụ: Công ty TNHH ABC")
+        input_kcn = st.selectbox("Khu Công Nghiệp", kcn_list)
+        input_services = st.multiselect(
+            "Dịch vụ sử dụng",
+            service_options,
+            help="Chọn một hoặc nhiều dịch vụ. Nếu không chọn dịch vụ, khách hàng sẽ được tính là nhóm tiềm năng/chưa dùng.",
+        )
+        input_revenue = st.number_input(
+            "Tổng doanh thu ước tính",
+            min_value=0.0,
+            value=0.0,
+            step=100000.0,
+            format="%.0f",
+        )
+
+        submitted = st.form_submit_button("Thêm Khách Hàng Mới", use_container_width=True)
+
+        if submitted:
+            if not input_mst.strip():
+                st.error("Vui lòng nhập Mã số thuế.")
+            elif not input_ten_kh.strip():
+                st.error("Vui lòng nhập Tên doanh nghiệp.")
+            else:
+                existing_mask = (
+                    (st.session_state.customer_df["mst"].astype(str).str.strip() == input_mst.strip())
+                    & (st.session_state.customer_df["ten_kcn"].astype(str) == input_kcn)
+                )
+
+                if existing_mask.any():
+                    st.warning("Mã số thuế này đã tồn tại trong KCN đã chọn. Dữ liệu chưa được thêm để tránh trùng.")
+                else:
+                    new_row = build_new_customer_row(
+                        current_df=st.session_state.customer_df,
+                        mst=input_mst,
+                        ten_kh=input_ten_kh,
+                        ten_kcn=input_kcn,
+                        selected_services=input_services,
+                        estimated_revenue=input_revenue,
+                    )
+
+                    new_row_df = pd.DataFrame([new_row], columns=st.session_state.customer_df.columns)
+                    st.session_state.customer_df = pd.concat(
+                        [st.session_state.customer_df, new_row_df],
+                        ignore_index=True,
+                    )
+                    st.session_state.added_customers_count += 1
+                    st.success("Đã thêm khách hàng mới. Dashboard đang cập nhật lại dữ liệu.")
+                    st.rerun()
+
+    if st.session_state.get("added_customers_count", 0) > 0:
+        st.caption(f"Đã thêm trong phiên này: {st.session_state.added_customers_count} khách hàng")
+
+    if st.button("🔄 Khôi phục dữ liệu gốc", use_container_width=True):
+        st.session_state.customer_df = base_df.copy()
+        st.session_state.added_customers_count = 0
+        st.success("Đã khôi phục dữ liệu gốc từ file Excel.")
+        st.rerun()
+
+# Sau khi form có thể cập nhật session_state, lấy lại DataFrame mới nhất để dashboard tính lại.
+df = st.session_state.customer_df.copy()
+
+
+# =========================
+# 6. Bộ lọc KCN
 # =========================
 st.subheader("🔎 Bộ lọc")
 
@@ -283,9 +453,8 @@ if selected_kcn == "Tất cả KCN":
 else:
     filtered_df = df[df["ten_kcn"] == selected_kcn].copy()
 
-
 # =========================
-# 6. KPI tổng quan
+# 7. KPI tổng quan
 # =========================
 total_customers = int(filtered_df["mst"].nunique())
 active_customers_df = filtered_df[filtered_df["tong_sl"] > 0].copy()
@@ -306,9 +475,8 @@ col3.metric("DN chưa dùng / tiềm năng", f"{potential_customers:,}")
 col4.metric("Tỷ lệ khai thác", f"{penetration_rate:.1f}%")
 col5.metric("Tổng doanh thu", f"{total_revenue:,.0f}")
 
-
 # =========================
-# 7. Phân tích dịch vụ chi tiết
+# 8. Phân tích dịch vụ chi tiết
 # =========================
 st.subheader("📊 Phân tích dịch vụ đang sử dụng")
 service_usage = get_service_usage(filtered_df)
@@ -329,13 +497,12 @@ else:
             hide_index=True,
         )
 
-
 # =========================
-# 8. Bảng chi tiết theo tabs
+# 9. Bảng chi tiết theo tabs
 # =========================
 st.subheader("📋 Danh sách khách hàng chi tiết")
 
-tab1, tab2 = st.tabs(["✅ Đang dùng dịch vụ", "🎯 Tiềm năng / Chưa dùng"])
+tab1, tab2, tab3 = st.tabs(["✅ Đang dùng dịch vụ", "🎯 Tiềm năng / Chưa dùng", "➕ Thêm Khách Hàng"])
 
 with tab1:
     st.write(f"Số khách hàng đang dùng dịch vụ: **{active_customers:,}**")
@@ -374,9 +541,26 @@ with tab2:
         mime="text/csv",
     )
 
+with tab3:
+    st.markdown(
+        """
+        Khu vực thêm khách hàng mới hiện đang nằm ở **thanh Sidebar bên trái**.
+        Sau khi bấm **Thêm Khách Hàng Mới**, dashboard sẽ cập nhật ngay các KPI, biểu đồ và bảng danh sách.
+
+        **Lưu ý:** dữ liệu thêm mới hiện chỉ được lưu trong phiên làm việc của Streamlit. Nếu bạn refresh app, redeploy app hoặc server restart, dữ liệu sẽ quay về file Excel gốc. Để lưu vĩnh viễn, bước tiếp theo nên kết nối Supabase/PostgreSQL.
+        """
+    )
+
+    added_rows = df[df.get("source_sheet", "") == "Nhập liệu thủ công"] if "source_sheet" in df.columns else pd.DataFrame()
+    if not added_rows.empty:
+        st.write("Các khách hàng đã thêm trong phiên này:")
+        added_table = prepare_display_table(added_rows, DISPLAY_COLUMNS)
+        st.dataframe(added_table, use_container_width=True, hide_index=True)
+    else:
+        st.info("Chưa có khách hàng nào được thêm trong phiên này.")
 
 # =========================
-# 9. Ghi chú kỹ thuật
+# 10. Ghi chú kỹ thuật
 # =========================
 with st.expander("📝 Ghi chú xử lý dữ liệu"):
     st.markdown(
@@ -386,6 +570,8 @@ with st.expander("📝 Ghi chú xử lý dữ liệu"):
         - Vì file chưa có cột `ten_kcn` riêng, app tự tạo `ten_kcn` dựa trên tên sheet.
         - Điều kiện **Đang dùng dịch vụ**: `tong_sl > 0`.
         - Điều kiện **Tiềm năng / Chưa dùng**: `tong_sl <= 0` hoặc null.
+        - Form thêm khách hàng dùng `st.session_state`, nên dữ liệu thêm mới chỉ tồn tại trong phiên chạy hiện tại.
+        - Nếu muốn lưu dữ liệu thêm mới vĩnh viễn, nên kết nối database như Supabase/PostgreSQL thay vì ghi ngược vào file Excel trên Streamlit Cloud.
         - Nếu muốn gom thêm sheet `DS TONG`, hãy thêm `"DS TONG"` vào biến `PREFERRED_SHEETS`.
         """
     )
